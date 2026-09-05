@@ -1,0 +1,58 @@
+﻿# ========================
+# Dependencies
+# ========================
+node_modules/
+client/node_modules/
+
+# ========================
+# Environment Variables
+# ========================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ========================
+# Build Output
+# ========================
+client/build/
+build/
+dist/
+
+# ========================
+# Logs
+# ========================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ========================
+# Runtime / OS files
+# ========================
+.DS_Store
+Thumbs.db
+*.pem
+
+# ========================
+# IDE / Editor
+# ========================
+.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# ========================
+# Testing
+# ========================
+coverage/
+
+# ========================
+# Misc
+# ========================
+.npm
+.eslintcache
