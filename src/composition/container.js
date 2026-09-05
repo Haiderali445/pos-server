@@ -1,6 +1,6 @@
 const UserModel = require("../infrastructure/models/userModels");
 const ItemModel = require("../infrastructure/models/itemModels");
-const BillModel = require("../infrastructure/models/billaModels");
+const BillModel = require("../infrastructure/models/billsModels");
 const DealerModel = require("../infrastructure/models/dealerModels");
 const ChargeModel = require("../infrastructure/models/chargesModels");
 const bcrypt = require("bcrypt");
