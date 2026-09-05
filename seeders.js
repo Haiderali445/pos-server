@@ -5,13 +5,14 @@ const mongoose = require("mongoose");
 const dotenv = require("dotenv");
 const bcrypt = require("bcrypt");
 const path = require("path");
-const connectDb = require("./config/config");
 const itemModel = require("./src/infrastructure/models/itemModels");
 const userModel = require("./src/infrastructure/models/userModels");
 const items = require("./src/infrastructure/seedData/items");
 require("colors");
 
-dotenv.config({ path: path.resolve(__dirname, ".env") });
+dotenv.config({ path: path.resolve(__dirname, ".env.local") });
+
+const connectDb = require("./config/config");
 
 const seedDatabase = async () => {
   try {
