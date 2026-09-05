@@ -4,11 +4,13 @@ const billSchema = mongoose.Schema(
   {
     costumerName: {
       type: String,
-      required: true,
+      default: "",
+      trim: true,
     },
     costumerNumber: {
-      type: Number,
-      required: true,
+      type: String,
+      default: "",
+      trim: true,
     },
     totalAmount: {
       type: Number,
