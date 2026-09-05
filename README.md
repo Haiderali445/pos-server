@@ -17,6 +17,10 @@
 
 ---
 
+📌 Executive Summary
+
+The Hardware Point POS backend is built on a robust Domain-Driven Design (DDD) and Hexagonal Architecture, ensuring strict separation between HTTP transport, application business rules, and MongoDB persistence. Key engineering highlights include atomic inventory decrement operations to guarantee stock integrity during checkout, built-in DNS fallback resolvers to bypass MongoDB Atlas connection restrictions, and secure role-based access control (RBAC) powered by JWT authentication and bcrypt credential hashing.
+
 ## 🏛️ Domain-Driven Design (DDD) & Layered Backend
 
 The server adopts a clean, layered architecture inspired by Domain-Driven Design and Hexagonal (Ports & Adapters) principles:
