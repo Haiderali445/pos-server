@@ -34,16 +34,23 @@ function createApp(dependencies = {}) {
 
   // Core Express Settings
   app.disable("x-powered-by");
-// Enable open CORS for all origins
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-tenant-id"],
-  })
-);
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+
+  // Dynamic CORS configuration allowing credentials
+  app.use(
+    cors({
+      origin: (origin, callback) => {
+        // Allow non-browser agents (Postman, curl) and echo back any browser origin
+        if (!origin) return callback(null, true);
+        return callback(null, true);
+      },
+      credentials: true,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization", "x-tenant-id"],
+    })
+  );
+
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
 
   if (process.env.NODE_ENV !== "test") {
     app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
