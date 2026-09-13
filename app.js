@@ -1,54 +1,73 @@
 const express = require("express");
 const morgan = require("morgan");
 const cors = require("cors");
-const { createContainer } = require("./src/composition/container");
 
-function createApp(container = createContainer()) {
-   const app = express();
+// Core Middlewares & Errors
+const { tenantResolver } = require("./src/core/middlewares/tenantResolver");
+const { errorHandler } = require("./src/core/errors/errorHandler");
 
-   app.disable("x-powered-by");
-   app.use(cors());
-   app.use(express.json());
-   app.use(express.urlencoded({ extended: false }));
-   app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+// Feature Module Services
+const AuthService = require("./src/modules/auth/auth.service");
+const InventoryService = require("./src/modules/inventory/inventory.service");
+const BillingService = require("./src/modules/billing/billing.service");
+const DealersService = require("./src/modules/expenses/dealers.service");
+const ChargesService = require("./src/modules/expenses/charges.service");
+const TenantService = require("./src/modules/tenant-admin/tenant.service");
 
-   app.get("/health", (_req, res) => {
-      res.status(200).json({ status: "ok" });
-   });
+// Feature Module Route Factories
+const createAuthRoutes = require("./src/modules/auth/auth.routes");
+const createInventoryRoutes = require("./src/modules/inventory/inventory.routes");
+const createBillingRoutes = require("./src/modules/billing/billing.routes");
+const { createDealerRoutes, createChargesRoutes } = require("./src/modules/expenses/expenses.routes");
+const { createUserManagementRoutes, createTenantConfigRoutes } = require("./src/modules/tenant-admin/tenant.routes");
 
-   app.use(
-      "/api/items",
-      require("./src/presentation/routes/itemRoutes")({
-         itemService: container.services.itemService,
-      })
-   );
-   app.use(
-      "/api/users",
-      require("./src/presentation/routes/userRoutes")({
-         authService: container.services.authService,
-      })
-   );
-   app.use(
-      "/api/bill",
-      require("./src/presentation/routes/billRoutes")({
-         checkoutService: container.services.checkoutService,
-         billRepository: container.repositories.billRepository,
-      })
-   );
-   app.use(
-      "/api/dealers",
-      require("./src/presentation/routes/dealerRoutes")({
-         dealerService: container.services.dealerService,
-      })
-   );
-   app.use(
-      "/api/charges",
-      require("./src/presentation/routes/chargesRoutes")({
-         chargeService: container.services.chargeService,
-      })
-   );
+function createApp(dependencies = {}) {
+  const app = express();
 
-   return app;
+  // Instantiate feature services
+  const authService = dependencies.authService || new AuthService();
+  const inventoryService = dependencies.inventoryService || new InventoryService();
+  const billingService = dependencies.billingService || new BillingService();
+  const dealersService = dependencies.dealersService || new DealersService();
+  const chargesService = dependencies.chargesService || new ChargesService();
+  const tenantService = dependencies.tenantService || new TenantService();
+
+  // Core Express Settings
+  app.disable("x-powered-by");
+  app.use(cors());
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+
+  if (process.env.NODE_ENV !== "test") {
+    app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+  }
+
+  // Tenant Resolution Context Middleware
+  app.use(tenantResolver);
+
+  // Health check endpoint
+  app.get("/health", (_req, res) => {
+    res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
+  // Combined User & Authentication Router (Maintains 100% backward compatibility)
+  const authRouter = createAuthRoutes(authService);
+  const userMgmtRouter = createUserManagementRoutes(tenantService);
+  const combinedUserRouter = express.Router();
+  combinedUserRouter.use(authRouter);
+  combinedUserRouter.use(userMgmtRouter);
+
+  app.use("/api/users", combinedUserRouter);
+  app.use("/api/items", createInventoryRoutes(inventoryService));
+  app.use("/api/bill", createBillingRoutes(billingService));
+  app.use("/api/dealers", createDealerRoutes(dealersService));
+  app.use("/api/charges", createChargesRoutes(chargesService));
+  app.use("/api/tenant", createTenantConfigRoutes(tenantService));
+
+  // Centralized Error Handling Middleware (must be last)
+  app.use(errorHandler);
+
+  return app;
 }
 
 module.exports = { createApp };
