@@ -8,6 +8,7 @@ require("colors");
 dotenv.config({ path: path.resolve(__dirname, ".env.local") });
 
 const { connectDatabase } = require("./src/core/database/connection");
+const { startKeepAliveJob } = require("./src/core/jobs/keepAlive");
 const { createApp } = require("./app");
 
 const port = Number(process.env.PORT) || 8080;
@@ -18,6 +19,9 @@ async function startServer() {
   const server = http.createServer(createApp());
   server.listen(port, () => {
     console.log(`Server running on port ${port}`.bgCyan.white);
+    
+    // Initialize 10-minute self-ping keep-alive job
+    startKeepAliveJob();
   });
 
   const shutdown = (signal) => {

@@ -1,7 +1,25 @@
 const { AppError } = require("./AppError");
 
 function errorHandler(err, req, res, _next) {
-  // Operational, trusted error: send message to client
+  // 1. Detect MongoDB & DNS Network Failures
+  const networkErrorCodes = ["ENOTFOUND", "ETIMEDOUT", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH"];
+  const isNetworkFailure =
+    err.name === "MongoServerSelectionError" ||
+    err.name === "MongoNetworkError" ||
+    err.errorCode === "NETWORK_ERROR" ||
+    networkErrorCodes.some((code) => err.message && err.message.includes(code));
+
+  if (isNetworkFailure) {
+    // Log complete raw error internally for backend debugging
+    console.error(`[Database Network Loss] ${req.method} ${req.url}:`, err);
+
+    return res.status(503).json({
+      error: "Internet connection error. Please check your network connection and try again.",
+      errorCode: "NETWORK_ERROR",
+    });
+  }
+
+  // 2. Operational, trusted domain errors
   if (err instanceof AppError) {
     return res.status(err.statusCode).json({
       error: err.message,
@@ -9,7 +27,7 @@ function errorHandler(err, req, res, _next) {
     });
   }
 
-  // Handle Mongoose CastError / ValidationError / MongoServerError
+  // 3. Handle Mongoose CastError / ValidationError / MongoServerError
   if (err.name === "CastError") {
     return res.status(400).json({
       error: `Invalid resource identifier format: ${err.value}`,
@@ -33,7 +51,7 @@ function errorHandler(err, req, res, _next) {
     });
   }
 
-  // Programming or unknown error: log & return generic 500
+  // 4. Programming or unknown error: log & return generic 500
   console.error("[Unhandled Error]:", err);
   return res.status(err.statusCode || 500).json({
     error: err.message || "Internal server error",

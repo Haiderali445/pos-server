@@ -34,9 +34,16 @@ function createApp(dependencies = {}) {
 
   // Core Express Settings
   app.disable("x-powered-by");
-  app.use(cors());
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: false }));
+// Enable open CORS for all origins
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-tenant-id"],
+  })
+);
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
   if (process.env.NODE_ENV !== "test") {
     app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));

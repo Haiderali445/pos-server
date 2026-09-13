@@ -38,6 +38,15 @@ class ConflictError extends AppError {
   }
 }
 
+class NetworkError extends AppError {
+  constructor(
+    message = "Unable to connect to the server. Please check your internet connection.",
+    errorCode = "NETWORK_ERROR"
+  ) {
+    super(message, 503, errorCode);
+  }
+}
+
 module.exports = {
   AppError,
   BadRequestError,
@@ -45,4 +54,5 @@ module.exports = {
   ForbiddenError,
   NotFoundError,
   ConflictError,
+  NetworkError,
 };
