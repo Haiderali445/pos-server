@@ -16,6 +16,10 @@ function createBillingRoutes(billingService) {
   router.post("/restore/:id", authenticate, requirePermission("bills:edit"), controller.restoreBill);
   router.post("/restore", authenticate, requirePermission("bills:edit"), controller.restoreBill);
 
+  // Financial Intelligence & Profit-Loss Statements (MUST BE DECLARED BEFORE /:id)
+  router.get("/reports/profit-loss", optionalAuthenticate, controller.getProfitLoss);
+  router.get("/profit-loss", optionalAuthenticate, controller.getProfitLoss);
+
   // Dynamic ID endpoints
   router.get("/:id", optionalAuthenticate, controller.getBillById);
   router.get("/:id/receipt", optionalAuthenticate, controller.getReceipt);

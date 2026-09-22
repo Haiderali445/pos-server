@@ -99,6 +99,19 @@ function createBillingController(billingService = new BillingService()) {
     }
   };
 
+  const getProfitLoss = async (req, res, next) => {
+    try {
+      const report = await billingService.getProfitLoss({
+        tenantId: req.tenantId,
+        startDate: req.query.startDate,
+        endDate: req.query.endDate,
+      });
+      return res.status(200).json(report);
+    } catch (error) {
+      next(error);
+    }
+  };
+
   return {
     getBills,
     getBillById,
@@ -109,6 +122,7 @@ function createBillingController(billingService = new BillingService()) {
     deleteBill,
     getReceipt,
     getVoidedBills,
+    getProfitLoss,
   };
 }
 

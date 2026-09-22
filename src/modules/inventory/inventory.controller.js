@@ -76,6 +76,36 @@ function createInventoryController(inventoryService = new InventoryService()) {
     }
   };
 
+  const receiveStock = async (req, res, next) => {
+    try {
+      const result = await inventoryService.receiveStock(req.body, {
+        tenantId: req.tenantId,
+        operatorId: req.user?.userId || "system",
+      });
+      return res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  const getPriceAudits = async (req, res, next) => {
+    try {
+      const audits = await inventoryService.getPriceAudits(req.params.id, req.tenantId);
+      return res.status(200).json(audits);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  const getStockMovements = async (req, res, next) => {
+    try {
+      const movements = await inventoryService.getStockMovements(req.params.id, req.tenantId);
+      return res.status(200).json(movements);
+    } catch (error) {
+      next(error);
+    }
+  };
+
   return {
     getItems,
     getItemById,
@@ -84,6 +114,9 @@ function createInventoryController(inventoryService = new InventoryService()) {
     deleteItem,
     getDeletedItems,
     restoreItem,
+    receiveStock,
+    getPriceAudits,
+    getStockMovements,
   };
 }
 

@@ -16,8 +16,13 @@ function createInventoryRoutes(inventoryService) {
   router.post("/restore/:id", authenticate, requirePermission("catalog:manage"), controller.restoreItem);
   router.post("/restore", authenticate, requirePermission("catalog:manage"), controller.restoreItem);
 
-  // Dynamic ID endpoint
+  // Stock replenishment (MUST BE DECLARED BEFORE /:id)
+  router.post("/receive-stock", authenticate, requirePermission("catalog:manage"), controller.receiveStock);
+
+  // Dynamic ID endpoints
   router.get("/:id", optionalAuthenticate, controller.getItemById);
+  router.get("/:id/price-audits", authenticate, requirePermission("catalog:read", "catalog:manage"), controller.getPriceAudits);
+  router.get("/:id/movements", authenticate, requirePermission("catalog:read", "catalog:manage"), controller.getStockMovements);
 
   // Catalog mutations
   router.post("/add-item", authenticate, requirePermission("catalog:manage"), controller.addItem);

@@ -13,11 +13,13 @@ const BillingService = require("./src/modules/billing/billing.service");
 const DealersService = require("./src/modules/expenses/dealers.service");
 const ChargesService = require("./src/modules/expenses/charges.service");
 const TenantService = require("./src/modules/tenant-admin/tenant.service");
+const AccountsService = require("./src/modules/accounts/accounts.service");
 
 // Feature Module Route Factories
 const createAuthRoutes = require("./src/modules/auth/auth.routes");
 const createInventoryRoutes = require("./src/modules/inventory/inventory.routes");
 const createBillingRoutes = require("./src/modules/billing/billing.routes");
+const createAccountRoutes = require("./src/modules/accounts/accounts.routes");
 const { createDealerRoutes, createChargesRoutes } = require("./src/modules/expenses/expenses.routes");
 const { createUserManagementRoutes, createTenantConfigRoutes } = require("./src/modules/tenant-admin/tenant.routes");
 
@@ -31,6 +33,7 @@ function createApp(dependencies = {}) {
   const dealersService = dependencies.dealersService || new DealersService();
   const chargesService = dependencies.chargesService || new ChargesService();
   const tenantService = dependencies.tenantService || new TenantService();
+  const accountsService = dependencies.accountsService || new AccountsService();
 
   // Core Express Settings
   app.disable("x-powered-by");
@@ -76,6 +79,9 @@ function createApp(dependencies = {}) {
   app.use("/api/bill", createBillingRoutes(billingService));
   app.use("/api/dealers", createDealerRoutes(dealersService));
   app.use("/api/charges", createChargesRoutes(chargesService));
+  const accountRouter = createAccountRoutes(accountsService);
+  app.use("/api/accounts", accountRouter);
+  app.use("/api/account", accountRouter);
   app.use("/api/tenant", createTenantConfigRoutes(tenantService));
 
   // Centralized Error Handling Middleware (must be last)
