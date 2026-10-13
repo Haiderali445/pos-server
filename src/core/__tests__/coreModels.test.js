@@ -187,7 +187,7 @@ async function runTests() {
       fare: 250,
       totalDiscount: 50,
       subtotal: 1500,
-      totalAmount: 1500,
+      totalAmount: 1700,
       paidAmount: 1200,
       paymentMethod: "cash",
       cartItems: [

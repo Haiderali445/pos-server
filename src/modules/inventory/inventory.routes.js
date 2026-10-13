@@ -18,6 +18,8 @@ function createInventoryRoutes(inventoryService) {
 
   // Stock replenishment (MUST BE DECLARED BEFORE /:id)
   router.post("/receive-stock", authenticate, requirePermission("catalog:manage"), controller.receiveStock);
+  router.get("/grn", optionalAuthenticate, controller.getPurchaseReceipts);
+  router.post("/grn", authenticate, requirePermission("catalog:manage", "pos:checkout"), controller.receivePurchaseInvoice);
 
   // Dynamic ID endpoints
   router.get("/:id", optionalAuthenticate, controller.getItemById);

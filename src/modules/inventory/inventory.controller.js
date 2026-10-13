@@ -88,6 +88,30 @@ function createInventoryController(inventoryService = new InventoryService()) {
     }
   };
 
+  const getPurchaseReceipts = async (req, res, next) => {
+    try {
+      const receipts = await inventoryService.getPurchaseReceipts({
+        tenantId: req.tenantId,
+        purchaseInvoiceId: req.query.purchaseInvoiceId,
+      });
+      return res.status(200).json(receipts);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  const receivePurchaseInvoice = async (req, res, next) => {
+    try {
+      const receipt = await inventoryService.receivePurchaseInvoice(req.body, {
+        tenantId: req.tenantId,
+        operatorId: req.user?.userId || "system",
+      });
+      return res.status(201).json(receipt);
+    } catch (error) {
+      next(error);
+    }
+  };
+
   const getPriceAudits = async (req, res, next) => {
     try {
       const audits = await inventoryService.getPriceAudits(req.params.id, req.tenantId);
@@ -115,6 +139,8 @@ function createInventoryController(inventoryService = new InventoryService()) {
     getDeletedItems,
     restoreItem,
     receiveStock,
+    getPurchaseReceipts,
+    receivePurchaseInvoice,
     getPriceAudits,
     getStockMovements,
   };

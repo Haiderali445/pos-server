@@ -20,6 +20,9 @@ function createBillingRoutes(billingService) {
   router.get("/reports/profit-loss", optionalAuthenticate, controller.getProfitLoss);
   router.get("/profit-loss", optionalAuthenticate, controller.getProfitLoss);
 
+  router.get("/:id/adjustments", optionalAuthenticate, controller.getBillAdjustments);
+  router.post("/:id/adjustments", authenticate, requirePermission("bills:edit", "pos:checkout"), controller.createAdjustment);
+
   // Dynamic ID endpoints
   router.get("/:id", optionalAuthenticate, controller.getBillById);
   router.get("/:id/receipt", optionalAuthenticate, controller.getReceipt);

@@ -11,11 +11,15 @@ const ProductPriceAudit = require("./ProductPriceAudit");
 const Category = require("./Category");
 const Unit = require("./Unit");
 const AccountTransaction = require("./AccountTransaction");
+const GoodsReceipt = require("./GoodsReceipt");
+const BillAdjustment = require("./BillAdjustment");
 const { softDeletePlugin } = require("./plugins/softDelete");
 
 module.exports = {
   Account,
   AccountTransaction,
+  GoodsReceipt,
+  BillAdjustment,
   Item,
   StockMovement,
   ProductPriceAudit,

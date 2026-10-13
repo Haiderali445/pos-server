@@ -58,6 +58,19 @@ function createAccountsController(accountsService = new AccountsService()) {
     }
   };
 
+  const recordBalanceAdjustment = async (req, res, next) => {
+    try {
+      const result = await accountsService.recordBalanceAdjustment(
+        req.params.id,
+        req.body,
+        { tenantId: req.tenantId, operatorId: req.user?.userId || req.user?.name || "system" }
+      );
+      return res.status(201).json(result);
+    } catch (error) {
+      next(error);
+    }
+  };
+
   const getAccountLedger = async (req, res, next) => {
     try {
       const ledger = await accountsService.getAccountLedger(req.params.id, {
@@ -75,6 +88,7 @@ function createAccountsController(accountsService = new AccountsService()) {
     createAccount,
     updateAccount,
     recordPayment,
+    recordBalanceAdjustment,
     getAccountLedger,
   };
 }

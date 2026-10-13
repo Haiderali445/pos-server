@@ -23,6 +23,31 @@ function createBillingController(billingService = new BillingService()) {
     }
   };
 
+  const createAdjustment = async (req, res, next) => {
+    try {
+      const adjustment = await billingService.createAdjustment(
+        req.params.id,
+        req.body,
+        {
+          tenantId: req.tenantId,
+          operatorId: req.user?.userId || "system",
+        }
+      );
+      return res.status(201).json(adjustment);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  const getBillAdjustments = async (req, res, next) => {
+    try {
+      const adjustments = await billingService.getBillAdjustments(req.params.id, req.tenantId);
+      return res.status(200).json(adjustments);
+    } catch (error) {
+      next(error);
+    }
+  };
+
   const createBill = async (req, res, next) => {
     try {
       const bill = await billingService.createBill(req.body, {
@@ -115,6 +140,8 @@ function createBillingController(billingService = new BillingService()) {
   return {
     getBills,
     getBillById,
+    createAdjustment,
+    getBillAdjustments,
     createBill,
     editBill,
     voidBill,

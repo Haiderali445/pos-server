@@ -41,6 +41,16 @@ const cartItemSchema = new mongoose.Schema(
       required: true,
       min: 0.001,
     },
+    receivedQuantity: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    adjustedReturnQuantity: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     unitPrice: {
       type: Number,
       required: true,
@@ -284,7 +294,7 @@ billSchema.methods.calculateMetrics = function () {
       item.purchasePrice = cost;
       item.unitDiscount = discount;
 
-      item.subtotal = Number((qty * price - discount).toFixed(2));
+      item.subtotal = Number(Math.max(0, qty * price - discount).toFixed(2));
       const lineCost = (Array.isArray(item.batchAllocations) && item.batchAllocations.length > 0)
         ? item.batchAllocations.reduce((sum, a) => sum + ((Number(a.unitCost) || 0) * (Number(a.quantity) || 0)), 0)
         : (cost * qty);
@@ -304,7 +314,7 @@ billSchema.methods.calculateMetrics = function () {
   this.totalItemsCount = Number(totalQty.toFixed(3));
 
   // Compute due balance
-  const netPayable = Number((Number(this.totalAmount || 0) + Number(this.fare || 0) - Number(this.totalDiscount || 0)).toFixed(2));
+  const netPayable = Number(Number(this.totalAmount || 0).toFixed(2));
   const paid = Number(this.paidAmount || 0);
   const remaining = Number((netPayable - paid).toFixed(2));
 

@@ -15,6 +15,7 @@ function createAccountRoutes(accountsService) {
   router.post("/", authenticate, requirePermission("dealers:manage", "pos:checkout"), controller.createAccount);
   router.post("/add-account", authenticate, requirePermission("dealers:manage", "pos:checkout"), controller.createAccount);
   router.post("/:id/payment", authenticate, requirePermission("dealers:manage", "pos:checkout"), controller.recordPayment);
+  router.post("/:id/adjustment", authenticate, requirePermission("dealers:manage", "pos:checkout"), controller.recordBalanceAdjustment);
 
   router.put("/:id", authenticate, requirePermission("dealers:manage"), controller.updateAccount);
   router.put("/edit-account", authenticate, requirePermission("dealers:manage"), controller.updateAccount);

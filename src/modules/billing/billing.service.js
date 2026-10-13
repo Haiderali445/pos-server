@@ -3,6 +3,8 @@ const Bill = require("../../core/models/Bill");
 const Item = require("../../core/models/Item");
 const Account = require("../../core/models/Account");
 const AccountTransaction = require("../../core/models/AccountTransaction");
+const BillAdjustment = require("../../core/models/BillAdjustment");
+const GoodsReceipt = require("../../core/models/GoodsReceipt");
 const StockMovement = require("../../core/models/StockMovement");
 const ProductPriceAudit = require("../../core/models/ProductPriceAudit");
 const Charge = require("../../core/models/Charge");
@@ -13,6 +15,8 @@ const { EVENT_TYPES } = require("../../core/events/eventTypes");
 const { NotFoundError, BadRequestError, ConflictError } = require("../../core/errors/AppError");
 const TaxStrategyFactory = require("../../strategies/tax/TaxStrategyFactory");
 const ReceiptStrategyFactory = require("../../strategies/receipts/ReceiptStrategyFactory");
+
+const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
 
 class BillingService {
   async getBills({
@@ -96,30 +100,31 @@ class BillingService {
     if (paidAmount === undefined || paidAmount === null) {
       throw new BadRequestError("Paid amount is required");
     }
+    if (invoiceType === "Purchase" && !accountId) {
+      throw new BadRequestError("A supplier account is required for a purchase invoice");
+    }
 
     const tenant = (await Tenant.findOne({ tenantId })) || { taxStrategy: "zero", taxRate: 0 };
     const taxStrategy = TaxStrategyFactory.getStrategy(tenant.taxStrategy || "zero");
 
-    const rawSubtotal = cartItems.reduce((sum, item) => {
-      const price = Number(item.unitPrice !== undefined ? item.unitPrice : item.salePrice || item.price || 0);
+    const rawSubtotal = roundMoney(cartItems.reduce((sum, item) => {
+      const price = invoiceType === "Purchase"
+        ? Number(item.unitCost !== undefined ? item.unitCost : item.purchasePrice || item.unitPrice || 0)
+        : Number(item.unitPrice !== undefined ? item.unitPrice : item.salePrice || item.price || 0);
       const qty = Number(item.quantity || 1);
-      return sum + price * qty;
-    }, 0);
+      const lineDiscount = Number(item.unitDiscount || 0);
+      return sum + Math.max(0, roundMoney(price * qty - lineDiscount));
+    }, 0));
 
-    const discountedSubtotal = Math.max(0, rawSubtotal - Number(totalDiscount || 0));
+    const discountedSubtotal = roundMoney(Math.max(0, rawSubtotal - Number(totalDiscount || 0)));
 
     const taxCalculation =
       invoiceType === "Sale"
         ? taxStrategy.calculateTax(discountedSubtotal, cartItems, tenant.taxRate || 0)
         : { taxAmount: 0, total: discountedSubtotal };
 
-    const expectedTotal = Number((taxCalculation.total + Number(fare || 0)).toFixed(2));
-
-    // Ensure tax and fare are always added to the final total
-    const finalTotal =
-      data.totalAmount !== undefined && Math.abs(Number(data.totalAmount) - expectedTotal) <= 0.05
-        ? Number(data.totalAmount)
-        : expectedTotal;
+    const expectedTotal = roundMoney(Number(taxCalculation.total) + Number(fare || 0));
+    const finalTotal = expectedTotal;
 
     const createdBill = await unitOfWork.runInTransaction(async (session, context) => {
       const billId = new mongoose.Types.ObjectId();
@@ -127,8 +132,8 @@ class BillingService {
       let linkedAccountId = accountId || null;
 
       const grandTotal = finalTotal;
-      const numPaid = Number(paidAmount || 0);
-      const unpaidAmount = Math.max(0, Number((grandTotal - numPaid).toFixed(2)));
+      const numPaid = roundMoney(paidAmount);
+      const unpaidAmount = Math.max(0, roundMoney(grandTotal - numPaid));
 
       // =========================================================================
       // SCENARIO 1: SALE CHECKOUT (FIFO Batch Consumption & Khata Integration)
@@ -174,7 +179,7 @@ class BillingService {
             cartItem.unitPrice !== undefined ? cartItem.unitPrice : cartItem.salePrice || cartItem.price || product.salePrice
           );
           const itemDiscount = Number(cartItem.unitDiscount || 0);
-          const totalItemRevenue = qtyNeeded * saleRate - itemDiscount;
+          const totalItemRevenue = roundMoney(qtyNeeded * saleRate - itemDiscount);
           const totalProfit = Number((totalItemRevenue - fifoResult.totalCost).toFixed(2));
           const unitProfit = Number((totalProfit / qtyNeeded).toFixed(2));
           const marginPct = saleRate > 0 ? Number((((saleRate - fifoResult.unitCost) / saleRate) * 100).toFixed(2)) : 0;
@@ -216,7 +221,7 @@ class BillingService {
             unitCost: fifoResult.unitCost,
             purchasePrice: fifoResult.unitCost,
             unitDiscount: itemDiscount,
-            subtotal: Number((qtyNeeded * saleRate - itemDiscount).toFixed(2)),
+            subtotal: totalItemRevenue,
             unitProfit,
             totalProfit,
             profitMarginPercentage: marginPct,
@@ -266,110 +271,62 @@ class BillingService {
           const creditDelta = unpaidAmount > 0 ? unpaidAmount : grandTotal;
           updatedCustomer = await Account.findOneAndUpdate(
             { _id: linkedAccountId, tenantId },
-            { $inc: { currentBalance: creditDelta } },
+            { $inc: { currentBalance: roundMoney(creditDelta) } },
             { new: true, session }
           );
         }
       }
 
       // =========================================================================
-      // SCENARIO 2: PURCHASE INVOICE (Batch Generation, Stock Increment, Price Audit)
+      // SCENARIO 2: PURCHASE INVOICE (supplier balance only; stock is posted by a GRN)
       // =========================================================================
       else if (invoiceType === "Purchase") {
+        const supplier = await Account.findOne({ _id: linkedAccountId, tenantId }).session(session);
+        if (!supplier || supplier.accountType !== "Supplier") {
+          throw new BadRequestError("Select a valid supplier account for this purchase invoice");
+        }
+        if (data.invoiceNumber) {
+          const duplicateInvoice = await Bill.findOne({
+            tenantId,
+            accountId: linkedAccountId,
+            invoiceType: "Purchase",
+            invoiceNumber: String(data.invoiceNumber).trim().toUpperCase(),
+            status: { $ne: "voided" },
+          }).session(session);
+          if (duplicateInvoice) {
+            throw new ConflictError("This supplier invoice number is already recorded");
+          }
+        }
+
         for (const cartItem of cartItems) {
           const productId = cartItem._id || cartItem.productId;
-          if (!productId) continue;
-
-          const product = await Item.findOne({ _id: productId, tenantId }).session(session);
-          if (!product) {
+          const product = productId
+            ? await Item.findOne({ _id: productId, tenantId }).session(session)
+            : null;
+          if (productId && !product) {
             throw new NotFoundError(`Product not found for purchase: ${cartItem.name || productId}`);
           }
 
-          const oldPurchaseCost = Number(product.purchasePrice || 0);
           const qty = Number(cartItem.quantity || 1);
           const unitCost = Number(
             cartItem.unitCost !== undefined ? cartItem.unitCost : cartItem.purchasePrice || 0
           );
-          const previousStock = product.stock;
-
-          // 1. Add new StockBatch to the item
-          const newBatch = product.addBatch({
-            batchCode:
-              cartItem.batchCode ||
-              `BATCH-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`,
-            qty,
-            unitCost,
-            supplierId: linkedAccountId,
-            expiryDate: cartItem.expiryDate || null,
-            receivedDate: data.date ? new Date(data.date) : new Date(),
-          });
-
-          // 2. Log ProductPriceAudit if unit purchase cost changed
-          if (oldPurchaseCost !== unitCost) {
-            await ProductPriceAudit.recordAudit(
-              {
-                productId: product._id,
-                productName: product.name,
-                oldPrice: oldPurchaseCost,
-                newPrice: unitCost,
-                priceType: "purchasePrice",
-                changeReason: `Purchase Invoice: ${data.invoiceNumber || "New Purchase"}`,
-                batchCode: newBatch.batchCode,
-                referenceId: billId,
-                referenceType: "Bill",
-                changedBy: operatorId,
-                tenantId,
-              },
-              { session }
-            );
-          }
-
-          await product.save({ session });
-
-          // 3. Record StockMovement
-          await StockMovement.recordMovement(
-            {
-              tenantId,
-              productId: product._id,
-              movementType: "Purchase",
-              changeQty: qty,
-              previousStock,
-              newStock: product.stock,
-              unitCost,
-              unitPrice: Number(cartItem.salePrice || product.salePrice || 0),
-              batchId: newBatch._id,
-              batchCode: newBatch.batchCode,
-              referenceId: billId,
-              referenceType: "Bill",
-              accountId: linkedAccountId,
-              reason: `Purchase receipt from supplier`,
-              performedBy: operatorId,
-            },
-            { session }
-          );
 
           enrichedCartItems.push({
             ...cartItem,
-            productId: product._id,
-            name: product.name,
-            sku: product.sku || "",
-            barcode: product.barcode || "",
-            category: product.category || "General",
+            productId: product?._id || productId || null,
+            name: product?.name || cartItem.name,
+            sku: product?.sku || cartItem.sku || "",
+            barcode: product?.barcode || cartItem.barcode || "",
+            category: product?.category || cartItem.category || "General",
             quantity: qty,
             unitPrice: unitCost,
             unitCost,
-            subtotal: Number((qty * unitCost).toFixed(2)),
+            subtotal: roundMoney(qty * unitCost),
             unitProfit: 0,
             totalProfit: 0,
             profitMarginPercentage: 0,
-            batchAllocations: [
-              {
-                batchId: newBatch._id,
-                batchCode: newBatch.batchCode,
-                quantity: qty,
-                unitCost,
-              },
-            ],
+            batchAllocations: [],
           });
         }
 
@@ -378,7 +335,7 @@ class BillingService {
         if (linkedAccountId) {
           await Account.findOneAndUpdate(
             { _id: linkedAccountId, tenantId },
-            { $inc: { currentBalance: grandTotal } },
+            { $inc: { currentBalance: roundMoney(grandTotal) } },
             { session }
           );
 
@@ -386,7 +343,7 @@ class BillingService {
           if (numPaid > 0) {
             await Account.findOneAndUpdate(
               { _id: linkedAccountId, tenantId },
-              { $inc: { currentBalance: -numPaid } },
+              { $inc: { currentBalance: -roundMoney(numPaid) } },
               { session }
             );
           }
@@ -413,7 +370,7 @@ class BillingService {
             costumerNumber: costumerNumber ? costumerNumber.trim() : "",
             fare: Number(fare || 0),
             totalDiscount: Number(totalDiscount || 0),
-            subtotal: Number(rawSubtotal.toFixed(2)),
+            subtotal: rawSubtotal,
             taxAmount: taxCalculation.taxAmount,
             totalAmount: grandTotal,
             paidAmount: numPaid,
@@ -539,6 +496,353 @@ class BillingService {
     return createdBill;
   }
 
+  async createAdjustment(billId, data, { tenantId = "default-store", operatorId = "system" } = {}) {
+    if (!billId) {
+      throw new BadRequestError("Original invoice ID is required for an adjustment");
+    }
+    if (!data.reason || !String(data.reason).trim()) {
+      throw new BadRequestError("An adjustment reason is required");
+    }
+    if (!Array.isArray(data.items) || data.items.length === 0) {
+      throw new BadRequestError("Add at least one returned or replacement item");
+    }
+
+    return unitOfWork.runInTransaction(async (session) => {
+      const bill = await Bill.findOne({ _id: billId, tenantId }).session(session);
+      if (!bill || !["Sale", "Purchase"].includes(bill.invoiceType)) {
+        throw new NotFoundError("Sale or purchase invoice not found");
+      }
+      if (bill.status !== "completed") {
+        throw new ConflictError("Only completed invoices can be adjusted");
+      }
+
+      const priorAdjustments = await BillAdjustment.find({
+        originalBillId: bill._id,
+        tenantId,
+      }).session(session);
+      const returnedBySource = new Map();
+      for (const adjustment of priorAdjustments) {
+        for (const line of adjustment.items) {
+          if (line.action === "return" && line.sourceItemIndex !== null) {
+            const key = String(line.sourceItemIndex);
+            returnedBySource.set(key, (returnedBySource.get(key) || 0) + Number(line.quantity || 0));
+          }
+        }
+      }
+      (bill.cartItems || []).forEach((line, index) => {
+        returnedBySource.set(
+          String(index),
+          Math.max(
+            returnedBySource.get(String(index)) || 0,
+            Number(line.adjustedReturnQuantity || 0)
+          )
+        );
+      });
+
+      const adjustmentId = new mongoose.Types.ObjectId();
+      const preparedLines = [];
+      let returnedAmount = 0;
+      let replacementAmount = 0;
+      const originalRawSubtotal = roundMoney((bill.cartItems || []).reduce((sum, line) => {
+        const qty = Number(line.quantity || 0);
+        const price = Number(line.unitPrice || line.salePrice || line.unitCost || 0);
+        return sum + Math.max(0, price * qty - Number(line.unitDiscount || 0));
+      }, 0));
+      const discountedSubtotal = Math.max(
+        0,
+        roundMoney(originalRawSubtotal - Number(bill.totalDiscount || 0))
+      );
+      const globalDiscountFactor = originalRawSubtotal > 0
+        ? discountedSubtotal / originalRawSubtotal
+        : 1;
+
+      for (const entry of data.items) {
+        const action = entry.action;
+        const quantity = Number(entry.quantity);
+        if (!["return", "replacement"].includes(action) || !Number.isFinite(quantity) || quantity <= 0) {
+          throw new BadRequestError("Each adjustment line needs an action and a quantity greater than zero");
+        }
+
+        let product;
+        let sourceItemIndex = null;
+        let condition = "resellable";
+        let unitPrice;
+        let unitCost;
+        let lineAmount;
+        let totalCost;
+
+        if (action === "return") {
+          sourceItemIndex = Number(entry.sourceItemIndex);
+          const source = Number.isInteger(sourceItemIndex) ? bill.cartItems[sourceItemIndex] : null;
+          if (!source) {
+            throw new BadRequestError("Returned items must be selected from the original invoice");
+          }
+          const productId = source.productId || source._id;
+          product = await Item.findOne({ _id: productId, tenantId }).session(session);
+          if (!product) {
+            throw new NotFoundError(`Returned product not found: ${source.name}`);
+          }
+
+          const sourceQty = Number(source.quantity || 0);
+          const previouslyReturned = returnedBySource.get(String(sourceItemIndex)) || 0;
+          if (previouslyReturned + quantity - sourceQty > 0.0005) {
+            throw new BadRequestError(
+              `Return quantity for '${source.name}' exceeds the ${Math.max(0, sourceQty - previouslyReturned)} remaining`
+            );
+          }
+          returnedBySource.set(String(sourceItemIndex), previouslyReturned + quantity);
+          bill.cartItems[sourceItemIndex].adjustedReturnQuantity = Number(
+            (previouslyReturned + quantity).toFixed(3)
+          );
+
+          const originalUnitPrice = Number(source.unitPrice || source.salePrice || source.unitCost || 0);
+          const originalLineAmount = Math.max(
+            0,
+            originalUnitPrice * sourceQty - Number(source.unitDiscount || 0)
+          );
+          const discountedLineAmount = originalLineAmount * globalDiscountFactor;
+          const allocatedTax = bill.invoiceType === "Sale" && discountedSubtotal > 0
+            ? Number(bill.taxAmount || 0) * discountedLineAmount / discountedSubtotal
+            : 0;
+          const fullReturnAmount = roundMoney(discountedLineAmount + allocatedTax);
+          const returnedBefore = previouslyReturned / (sourceQty || 1);
+          const returnedAfter = (previouslyReturned + quantity) / (sourceQty || 1);
+          lineAmount = roundMoney(fullReturnAmount * returnedAfter) -
+            roundMoney(fullReturnAmount * returnedBefore);
+
+          const originalLineCost = Array.isArray(source.batchAllocations) && source.batchAllocations.length > 0
+            ? source.batchAllocations.reduce(
+              (sum, allocation) =>
+                sum + Number(allocation.unitCost || 0) * Number(allocation.quantity || 0),
+              0
+            )
+            : Number(source.unitCost || source.purchasePrice || 0) * sourceQty;
+          const costBefore = roundMoney(originalLineCost * returnedBefore);
+          const costAfter = roundMoney(originalLineCost * returnedAfter);
+          totalCost = Math.max(0, roundMoney(costAfter - costBefore));
+          unitCost = quantity > 0 ? roundMoney(totalCost / quantity) : 0;
+          unitPrice = quantity > 0 ? Number((lineAmount / quantity).toFixed(4)) : 0;
+          condition = bill.invoiceType === "Sale"
+            ? entry.condition === "damaged" ? "damaged" : "resellable"
+            : "resellable";
+        } else {
+          if (!entry.productId) {
+            throw new BadRequestError("Replacement items must be selected from the product catalog");
+          }
+          product = await Item.findOne({ _id: entry.productId, tenantId }).session(session);
+          if (!product) {
+            throw new NotFoundError("Replacement product not found");
+          }
+          unitPrice = bill.invoiceType === "Sale"
+            ? roundMoney(product.salePrice)
+            : roundMoney(product.purchasePrice);
+          unitCost = roundMoney(product.purchasePrice);
+          totalCost = roundMoney(unitCost * quantity);
+          lineAmount = roundMoney(unitPrice * quantity);
+          if (bill.invoiceType === "Sale" && discountedSubtotal > 0) {
+            lineAmount = roundMoney(
+              lineAmount * (1 + Number(bill.taxAmount || 0) / discountedSubtotal)
+            );
+          }
+        }
+
+        if (action === "return") returnedAmount = roundMoney(returnedAmount + lineAmount);
+        else replacementAmount = roundMoney(replacementAmount + lineAmount);
+
+        const previousStock = product.stock;
+        if (bill.invoiceType === "Sale" && action === "return" && condition === "resellable") {
+          const batch = product.addBatch({
+            batchCode: `RETURN-${adjustmentId.toString().slice(-8)}`,
+            qty: quantity,
+            unitCost,
+            supplierId: bill.accountId,
+            purchaseInvoiceId: bill._id,
+            receivedDate: data.date ? new Date(data.date) : new Date(),
+          });
+          await product.save({ session });
+          await StockMovement.recordMovement(
+            {
+              tenantId,
+              productId: product._id,
+              movementType: "Return",
+              changeQty: quantity,
+              previousStock,
+              newStock: product.stock,
+              unitCost,
+              unitPrice,
+              batchId: batch._id,
+              batchCode: batch.batchCode,
+              referenceId: adjustmentId,
+              referenceType: "BillAdjustment",
+              accountId: bill.accountId,
+              reason: `Resellable return for invoice ${bill.invoiceNumber}: ${data.reason}`,
+              performedBy: operatorId,
+            },
+            { session }
+          );
+        } else if (bill.invoiceType === "Purchase" && action === "replacement") {
+          const batch = product.addBatch({
+            batchCode: `REPLACE-${adjustmentId.toString().slice(-8)}`,
+            qty: quantity,
+            unitCost,
+            supplierId: bill.accountId,
+            purchaseInvoiceId: bill._id,
+            receivedDate: data.date ? new Date(data.date) : new Date(),
+          });
+          await product.save({ session });
+          await StockMovement.recordMovement(
+            {
+              tenantId,
+              productId: product._id,
+              movementType: "Adjustment",
+              changeQty: quantity,
+              previousStock,
+              newStock: product.stock,
+              unitCost,
+              unitPrice,
+              batchId: batch._id,
+              batchCode: batch.batchCode,
+              referenceId: adjustmentId,
+              referenceType: "BillAdjustment",
+              accountId: bill.accountId,
+              reason: `Supplier replacement for invoice ${bill.invoiceNumber}: ${data.reason}`,
+              performedBy: operatorId,
+            },
+            { session }
+          );
+        } else if (
+          (bill.invoiceType === "Purchase" && action === "return") ||
+          (bill.invoiceType === "Sale" && action === "replacement")
+        ) {
+          let fifoResult;
+          try {
+            fifoResult = product.consumeFIFO(quantity);
+          } catch (error) {
+            throw new ConflictError(error.message);
+          }
+          await product.save({ session });
+          for (const allocation of fifoResult.allocations) {
+            await StockMovement.recordMovement(
+              {
+                tenantId,
+                productId: product._id,
+                movementType: action === "return" ? "Return" : "Adjustment",
+                changeQty: -Number(allocation.quantity),
+                previousStock,
+                newStock: product.stock,
+                unitCost: allocation.unitCost,
+                unitPrice,
+                batchId: allocation.batchId,
+                batchCode: allocation.batchCode,
+                referenceId: adjustmentId,
+                referenceType: "BillAdjustment",
+                accountId: bill.accountId,
+                reason: `${action === "return" ? "Return to supplier" : "Customer replacement"} for invoice ${bill.invoiceNumber}: ${data.reason}`,
+                performedBy: operatorId,
+              },
+              { session }
+            );
+          }
+          totalCost = roundMoney(fifoResult.totalCost);
+          if (bill.invoiceType === "Sale") unitCost = fifoResult.unitCost;
+        } else if (bill.invoiceType === "Sale" && action === "return" && condition === "damaged") {
+          await StockMovement.recordMovement(
+            {
+              tenantId,
+              productId: product._id,
+              movementType: "Return",
+              changeQty: 0,
+              previousStock,
+              newStock: previousStock,
+              unitCost,
+              unitPrice,
+              referenceId: adjustmentId,
+              referenceType: "BillAdjustment",
+              accountId: bill.accountId,
+              reason: `Damaged return not restocked for invoice ${bill.invoiceNumber}: ${data.reason}`,
+              performedBy: operatorId,
+            },
+            { session }
+          );
+        }
+
+        preparedLines.push({
+          action,
+          sourceItemIndex,
+          productId: product._id,
+          name: product.name,
+          quantity,
+          condition,
+          unitPrice,
+          unitCost,
+          totalCost,
+          totalAmount: lineAmount,
+        });
+      }
+
+      const balanceChange = roundMoney(replacementAmount - returnedAmount);
+      const adjustment = new BillAdjustment({
+        _id: adjustmentId,
+        adjustmentNumber: `ADJ-${Date.now().toString().slice(-8)}`,
+        originalBillId: bill._id,
+        invoiceNumber: bill.invoiceNumber,
+        invoiceType: bill.invoiceType,
+        accountId: bill.accountId,
+        reason: String(data.reason).trim(),
+        items: preparedLines,
+        returnedAmount,
+        replacementAmount,
+        balanceChange,
+        date: data.date ? new Date(data.date) : new Date(),
+        tenantId,
+        operatorId,
+      });
+      await bill.save({ session });
+      await adjustment.save({ session });
+
+      if (bill.accountId && balanceChange !== 0) {
+        const account = await Account.findOne({ _id: bill.accountId, tenantId }).session(session);
+        if (!account) {
+          throw new NotFoundError("Invoice account not found");
+        }
+        const customer = bill.invoiceType === "Sale";
+        const updatedAccount = await Account.findOneAndUpdate(
+          { _id: bill.accountId, tenantId },
+          { $inc: { currentBalance: balanceChange } },
+          { new: true, session }
+        );
+        await AccountTransaction.create(
+          [
+            {
+              tenantId,
+              accountId: bill.accountId,
+              transactionType: "Adjustment",
+              amount: Math.abs(balanceChange),
+              debit: customer
+                ? Math.max(0, balanceChange)
+                : Math.max(0, -balanceChange),
+              credit: customer
+                ? Math.max(0, -balanceChange)
+                : Math.max(0, balanceChange),
+              balanceAfter: updatedAccount.currentBalance,
+              reference_table: "Adjustments",
+              reference_id: adjustment._id,
+              relatedInvoiceId: bill._id,
+              invoiceNumber: bill.invoiceNumber,
+              description: `Adjustment for invoice ${bill.invoiceNumber}`,
+              notes: String(data.reason).trim(),
+              date: adjustment.date,
+              operatorId,
+            },
+          ],
+          { session }
+        );
+      }
+
+      return adjustment;
+    });
+  }
+
   async editBill(data, tenantId = "default-store") {
     const id = data._id || data.billId;
     if (!id) {
@@ -562,6 +866,19 @@ class BillingService {
     return bill;
   }
 
+  async getBillAdjustments(billId, tenantId = "default-store") {
+    if (!billId) {
+      throw new BadRequestError("Invoice ID is required");
+    }
+    const bill = await Bill.findOne({ _id: billId, tenantId });
+    if (!bill) {
+      throw new NotFoundError("Invoice not found");
+    }
+    return BillAdjustment.find({ originalBillId: bill._id, tenantId })
+      .populate("accountId", "name accountCode accountType")
+      .sort({ date: -1, createdAt: -1 });
+  }
+
   async voidBill(id, tenantId = "default-store", operatorId = "system") {
     if (!id) {
       throw new BadRequestError("Invoice ID is required to void");
@@ -575,20 +892,122 @@ class BillingService {
     if (bill.status === "voided") {
       throw new ConflictError("Invoice is already voided");
     }
+    const existingAdjustment = await BillAdjustment.findOne({ originalBillId: bill._id, tenantId });
+    if (existingAdjustment) {
+      throw new ConflictError("This invoice has adjustments. Record a reversing adjustment instead of voiding it.");
+    }
 
     const voidedBill = await unitOfWork.runInTransaction(async (session) => {
       // 1. Reverse stock adjustments
-      for (const item of bill.cartItems || []) {
-        const productId = item.productId || item._id;
-        if (!productId) continue;
+      if (bill.invoiceType === "Purchase") {
+        const receipts = await GoodsReceipt.find({
+          purchaseInvoiceId: bill._id,
+          tenantId,
+          status: "completed",
+        }).session(session);
 
-        const product = await Item.findOne({ _id: productId, tenantId }).session(session);
-        if (!product) continue;
+        if (receipts.length > 0) {
+          for (const receipt of receipts) {
+            for (const line of receipt.items) {
+              const product = await Item.findOne({ _id: line.productId, tenantId }).session(session);
+              if (!product) {
+                throw new ConflictError(`Cannot void purchase invoice: product '${line.name}' no longer exists`);
+              }
+              const batch = line.batchId ? product.batches.id(line.batchId) : null;
+              const qty = Number(line.quantity || 0);
+              if (!batch || batch.availableQty + 0.0005 < qty || product.stock + 0.0005 < qty) {
+                throw new ConflictError(
+                  `Cannot void purchase invoice: ${line.name} has already been sold or used. Record a return adjustment instead.`
+                );
+              }
 
-        const previousStock = product.stock;
-        const qty = Number(item.quantity || 1);
+              const previousStock = product.stock;
+              batch.availableQty = Number((batch.availableQty - qty).toFixed(3));
+              product.stock = Number((product.stock - qty).toFixed(3));
+              if (product.stock < 0) {
+                throw new ConflictError(`Cannot void purchase invoice: stock for ${line.name} would become negative`);
+              }
+              product.purchasePrice = product.batches
+                .filter((candidate) => candidate.availableQty > 0)
+                .sort((left, right) => right.receivedDate - left.receivedDate)[0]?.unitCost || 0;
+              await product.save({ session });
+              await StockMovement.recordMovement(
+                {
+                  tenantId,
+                  productId: product._id,
+                  movementType: "Void",
+                  changeQty: -qty,
+                  previousStock,
+                  newStock: product.stock,
+                  unitCost: line.unitCost,
+                  referenceId: receipt._id,
+                  referenceType: "GRN",
+                  accountId: bill.accountId,
+                  reason: `Void GRN for purchase invoice ${bill.invoiceNumber}`,
+                  performedBy: operatorId,
+                },
+                { session }
+              );
+            }
+            receipt.status = "voided";
+            await receipt.save({ session });
+          }
+        } else {
+          // Older purchase bills posted stock directly during invoice creation.
+          for (const item of bill.cartItems || []) {
+            if (!Array.isArray(item.batchAllocations) || item.batchAllocations.length === 0) continue;
+            const productId = item.productId || item._id;
+            const product = await Item.findOne({ _id: productId, tenantId }).session(session);
+            if (!product) {
+              throw new ConflictError(`Cannot void purchase invoice: product '${item.name}' no longer exists`);
+            }
+            const previousStock = product.stock;
+            for (const allocation of item.batchAllocations) {
+              const batch = allocation.batchId ? product.batches.id(allocation.batchId) : null;
+              const qty = Number(allocation.quantity || 0);
+              if (!batch || batch.availableQty + 0.0005 < qty || product.stock + 0.0005 < qty) {
+                throw new ConflictError(
+                  `Cannot void purchase invoice: ${item.name} has already been sold or used. Record a return adjustment instead.`
+                );
+              }
+              batch.availableQty = Number((batch.availableQty - qty).toFixed(3));
+              product.stock = Number((product.stock - qty).toFixed(3));
+            }
+            product.purchasePrice = product.batches
+              .filter((batch) => batch.availableQty > 0)
+              .sort((left, right) => right.receivedDate - left.receivedDate)[0]?.unitCost || 0;
+            await product.save({ session });
+            await StockMovement.recordMovement(
+              {
+                tenantId,
+                productId: product._id,
+                movementType: "Void",
+                changeQty: -Number(item.quantity || 0),
+                previousStock,
+                newStock: product.stock,
+                unitCost: Number(item.unitCost || 0),
+                referenceId: bill._id,
+                referenceType: "Bill",
+                accountId: bill.accountId,
+                reason: `Void purchase invoice ${bill.invoiceNumber}`,
+                performedBy: operatorId,
+              },
+              { session }
+            );
+          }
+        }
+      } else if (bill.invoiceType === "Sale") {
+        for (const item of bill.cartItems || []) {
+          const productId = item.productId || item._id;
+          if (!productId) continue;
 
-        if (bill.invoiceType === "Sale") {
+          const product = await Item.findOne({ _id: productId, tenantId }).session(session);
+          if (!product) {
+            throw new ConflictError(`Cannot void invoice: product '${item.name}' no longer exists`);
+          }
+
+          const previousStock = product.stock;
+          const qty = Number(item.quantity || 1);
           // Restore stock back into product
           product.stock = Number((product.stock + qty).toFixed(3));
 
@@ -597,9 +1016,10 @@ class BillingService {
             for (const alloc of item.batchAllocations) {
               if (alloc.batchId) {
                 const batch = product.batches.id(alloc.batchId);
-                if (batch) {
-                  batch.availableQty = Number((batch.availableQty + Number(alloc.quantity || 0)).toFixed(3));
+                if (!batch) {
+                  throw new ConflictError(`Cannot void invoice: stock batch for '${item.name}' no longer exists`);
                 }
+                batch.availableQty = Number((batch.availableQty + Number(alloc.quantity || 0)).toFixed(3));
               }
             }
           }
@@ -621,31 +1041,6 @@ class BillingService {
               referenceType: "Bill",
               accountId: bill.accountId,
               reason: `Void invoice reversal - ${bill.invoiceNumber || bill._id}`,
-              performedBy: operatorId,
-            },
-            { session }
-          );
-        } else if (bill.invoiceType === "Purchase") {
-          // Deduct previously purchased stock
-          if (product.stock >= qty) {
-            product.stock = Number((product.stock - qty).toFixed(3));
-            await product.save({ session });
-          }
-
-          await StockMovement.recordMovement(
-            {
-              tenantId,
-              productId: product._id,
-              movementType: "Void",
-              changeQty: -qty,
-              previousStock,
-              newStock: product.stock,
-              unitCost: Number(item.unitCost || 0),
-              unitPrice: Number(item.unitPrice || 0),
-              referenceId: bill._id,
-              referenceType: "Bill",
-              accountId: bill.accountId,
-              reason: `Void purchase reversal - ${bill.invoiceNumber || bill._id}`,
               performedBy: operatorId,
             },
             { session }
@@ -685,7 +1080,7 @@ class BillingService {
             );
           }
         } else if (bill.invoiceType === "Purchase") {
-          const revAmt = bill.dueAmount > 0 ? bill.dueAmount : bill.totalAmount;
+          const revAmt = roundMoney(bill.dueAmount || 0);
           const revAccount = await Account.findOneAndUpdate(
             { _id: bill.accountId, tenantId },
             { $inc: { currentBalance: -revAmt } },
@@ -718,7 +1113,10 @@ class BillingService {
       }
 
       bill.status = "voided";
-      await bill.softDelete(operatorId);
+      bill.isDeleted = true;
+      bill.deletedAt = new Date();
+      bill.deletedBy = operatorId;
+      await bill.save({ session });
       return bill;
     });
 
@@ -740,28 +1138,161 @@ class BillingService {
     if (!bill) {
       throw new NotFoundError("Invoice not found");
     }
+    if (bill.status !== "voided") {
+      throw new ConflictError("Only voided invoices can be restored");
+    }
+    const existingAdjustment = await BillAdjustment.findOne({ originalBillId: bill._id, tenantId });
+    if (existingAdjustment) {
+      throw new ConflictError("This invoice has adjustments and cannot be restored");
+    }
 
     const restoredBill = await unitOfWork.runInTransaction(async (session) => {
-      for (const item of bill.cartItems || []) {
-        const productId = item.productId || item._id;
-        if (!productId) continue;
-
-        await Item.findOneAndUpdate(
-          { _id: productId, tenantId },
-          { $inc: { stock: -Number(item.quantity || 1) } },
+      const restoreStock = async (
+        productId,
+        name,
+        qty,
+        allocations,
+        direction,
+        referenceId = bill._id,
+        referenceType = "Bill"
+      ) => {
+        const product = await Item.findOne({ _id: productId, tenantId }).session(session);
+        if (!product) {
+          throw new ConflictError(`Cannot restore invoice: product '${name}' no longer exists`);
+        }
+        const previousStock = product.stock;
+        for (const allocation of allocations || []) {
+          if (!allocation.batchId) continue;
+          const batch = product.batches.id(allocation.batchId);
+          const allocationQty = Number(allocation.quantity || 0);
+          if (!batch) {
+            throw new ConflictError(`Cannot restore invoice: stock batch for '${name}' no longer exists`);
+          }
+          if (direction < 0 && batch.availableQty + 0.0005 < allocationQty) {
+            throw new ConflictError(
+              `Cannot restore invoice: not enough stock remains in the original batch for '${name}'`
+            );
+          }
+          batch.availableQty = Number((batch.availableQty + direction * allocationQty).toFixed(3));
+        }
+        if (direction < 0 && product.stock + 0.0005 < qty) {
+          throw new ConflictError(`Cannot restore invoice: not enough stock remains for '${name}'`);
+        }
+        product.stock = Number((product.stock + direction * qty).toFixed(3));
+        if (bill.invoiceType === "Purchase") {
+          product.purchasePrice = product.batches
+            .filter((batch) => batch.availableQty > 0)
+            .sort((left, right) => right.receivedDate - left.receivedDate)[0]?.unitCost || 0;
+        }
+        await product.save({ session });
+        await StockMovement.recordMovement(
+          {
+            tenantId,
+            productId: product._id,
+            movementType: "Void",
+            changeQty: direction * qty,
+            previousStock,
+            newStock: product.stock,
+            referenceId,
+            referenceType,
+            accountId: bill.accountId,
+            reason: `Restore invoice ${bill.invoiceNumber || bill._id}`,
+            performedBy: "system",
+          },
           { session }
         );
+      };
+
+      if (bill.invoiceType === "Sale") {
+        for (const item of bill.cartItems || []) {
+          const productId = item.productId || item._id;
+          if (!productId) continue;
+          await restoreStock(
+            productId,
+            item.name,
+            Number(item.quantity || 1),
+            item.batchAllocations,
+            -1
+          );
+        }
+      } else if (bill.invoiceType === "Purchase") {
+        const receipts = await GoodsReceipt.find({
+          purchaseInvoiceId: bill._id,
+          tenantId,
+          status: "voided",
+        }).session(session);
+        if (receipts.length > 0) {
+          for (const receipt of receipts) {
+            for (const line of receipt.items) {
+              await restoreStock(
+                line.productId,
+                line.name,
+                Number(line.quantity || 0),
+                [{ batchId: line.batchId, quantity: line.quantity }],
+                1,
+                receipt._id,
+                "GRN"
+              );
+            }
+            receipt.status = "completed";
+            await receipt.save({ session });
+          }
+        } else {
+          // Legacy purchase bills received stock when the invoice was created.
+          for (const item of bill.cartItems || []) {
+            const productId = item.productId || item._id;
+            if (!productId || !item.batchAllocations?.length) continue;
+            await restoreStock(
+              productId,
+              item.name,
+              Number(item.quantity || 0),
+              item.batchAllocations,
+              1
+            );
+          }
+        }
+      }
+
+      if (bill.accountId) {
+        const amount = roundMoney(bill.dueAmount || 0);
+        if (amount > 0) {
+          const account = await Account.findOneAndUpdate(
+            { _id: bill.accountId, tenantId },
+            { $inc: { currentBalance: amount } },
+            { new: true, session }
+          );
+          if (!account) {
+            throw new NotFoundError("Invoice account not found");
+          }
+          await AccountTransaction.create(
+            [
+              {
+                tenantId,
+                accountId: bill.accountId,
+                transactionType: bill.invoiceType === "Sale" ? "Credit" : "Purchase",
+                amount,
+                debit: bill.invoiceType === "Sale" ? amount : 0,
+                credit: bill.invoiceType === "Purchase" ? amount : 0,
+                balanceAfter: account.currentBalance,
+                reference_table: "Invoices",
+                reference_id: bill._id,
+                invoiceNumber: bill.invoiceNumber,
+                description: `Restore invoice ${bill.invoiceNumber}`,
+                notes: `Restored outstanding balance: PKR ${amount.toFixed(2)}`,
+                date: new Date(),
+                operatorId: "system",
+              },
+            ],
+            { session }
+          );
+        }
       }
 
       bill.status = "completed";
-      if (typeof bill.restore === "function") {
-        await bill.restore();
-      } else {
-        bill.isDeleted = false;
-        bill.deletedAt = null;
-        bill.deletedBy = null;
-        await bill.save({ session });
-      }
+      bill.isDeleted = false;
+      bill.deletedAt = null;
+      bill.deletedBy = null;
+      await bill.save({ session });
 
       return bill;
     });
@@ -855,6 +1386,57 @@ class BillingService {
         productStats[prodKey].revenue = Number((productStats[prodKey].revenue + lineRevenue).toFixed(2));
         productStats[prodKey].cogs = Number((productStats[prodKey].cogs + lineCOGS).toFixed(2));
         productStats[prodKey].profit = Number((productStats[prodKey].profit + lineProfit).toFixed(2));
+      }
+    }
+
+    const salesAdjustments = await BillAdjustment.find({
+      tenantId,
+      invoiceType: "Sale",
+      date: { $gte: start, $lte: end },
+    }).lean();
+
+    for (const adjustment of salesAdjustments) {
+      grossSales = roundMoney(grossSales + Number(adjustment.balanceChange || 0));
+
+      for (const line of adjustment.items || []) {
+        const quantity = Number(line.quantity || 0);
+        const lineAmount = Number(line.totalAmount || 0);
+        const storedLineCost = Number(line.totalCost || 0);
+        const lineCost = storedLineCost > 0 || Number(line.unitCost || 0) === 0
+          ? storedLineCost
+          : roundMoney(Number(line.unitCost || 0) * quantity);
+        const isReturn = line.action === "return";
+        const revenueChange = isReturn ? -lineAmount : lineAmount;
+        const costChange = isReturn
+          ? line.condition === "resellable" ? -lineCost : 0
+          : lineCost;
+        const unitsChange = isReturn ? -quantity : quantity;
+        totalCOGS = roundMoney(totalCOGS + costChange);
+        totalUnitsSold = Number((totalUnitsSold + unitsChange).toFixed(3));
+
+        const productKey = String(line.productId || line.name);
+        if (!productStats[productKey]) {
+          productStats[productKey] = {
+            productId: line.productId,
+            name: line.name,
+            unitsSold: 0,
+            revenue: 0,
+            cogs: 0,
+            profit: 0,
+          };
+        }
+        productStats[productKey].unitsSold = Number(
+          (productStats[productKey].unitsSold + unitsChange).toFixed(3)
+        );
+        productStats[productKey].revenue = roundMoney(
+          productStats[productKey].revenue + revenueChange
+        );
+        productStats[productKey].cogs = roundMoney(
+          productStats[productKey].cogs + costChange
+        );
+        productStats[productKey].profit = roundMoney(
+          productStats[productKey].profit + revenueChange - costChange
+        );
       }
     }
 

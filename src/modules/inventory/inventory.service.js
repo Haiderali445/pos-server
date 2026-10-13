@@ -1,12 +1,23 @@
+const mongoose = require("mongoose");
 const Item = require("../../core/models/Item");
 const StockMovement = require("../../core/models/StockMovement");
 const ProductPriceAudit = require("../../core/models/ProductPriceAudit");
+const Bill = require("../../core/models/Bill");
+const GoodsReceipt = require("../../core/models/GoodsReceipt");
 const { unitOfWork } = require("../../core/database/unitOfWork");
 const { NotFoundError, BadRequestError } = require("../../core/errors/AppError");
 const { appEvents } = require("../../core/events/eventEmitter");
 const { EVENT_TYPES } = require("../../core/events/eventTypes");
 
 class InventoryService {
+  async getPurchaseReceipts({ tenantId = "default-store", purchaseInvoiceId = "" } = {}) {
+    const query = { tenantId };
+    if (purchaseInvoiceId) query.purchaseInvoiceId = purchaseInvoiceId;
+    return GoodsReceipt.find(query)
+      .populate("purchaseInvoiceId", "invoiceNumber totalAmount invoiceType")
+      .sort({ date: -1, createdAt: -1 });
+  }
+
   async getItems({ tenantId = "default-store", search = "", category = "" } = {}) {
     const query = { tenantId, isDeleted: { $ne: true } };
 
@@ -238,6 +249,173 @@ class InventoryService {
       );
 
       return { item, batch };
+    });
+  }
+
+  async receivePurchaseInvoice(data, { tenantId = "default-store", operatorId = "system" } = {}) {
+    const { purchaseInvoiceId, items, grnNumber, date, notes } = data;
+    if (!purchaseInvoiceId) {
+      throw new BadRequestError("Purchase invoice ID is required for a goods receipt");
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new BadRequestError("At least one received item is required");
+    }
+
+    const receivedLines = items.map((line) => {
+      const quantity = Number(line.quantity ?? line.receivedQty);
+      if (!line.productId || !Number.isFinite(quantity) || quantity <= 0) {
+        throw new BadRequestError("Each received item needs a product and a quantity greater than zero");
+      }
+      return { productId: String(line.productId), quantity };
+    });
+    const productIds = receivedLines.map((line) => line.productId);
+    if (new Set(productIds).size !== productIds.length) {
+      throw new BadRequestError("Each product can appear only once on a goods receipt");
+    }
+
+    return unitOfWork.runInTransaction(async (session) => {
+      const invoice = await Bill.findOne({
+        _id: purchaseInvoiceId,
+        tenantId,
+        invoiceType: "Purchase",
+        status: "completed",
+      }).session(session);
+      if (!invoice) {
+        throw new NotFoundError("Completed purchase invoice not found");
+      }
+
+      const invoiceLines = new Map();
+      (invoice.cartItems || []).forEach((line, index) => {
+        if (line.productId) invoiceLines.set(String(line.productId), { line, index });
+      });
+      const previousReceipts = await GoodsReceipt.find({
+        purchaseInvoiceId: invoice._id,
+        tenantId,
+        status: "completed",
+      }).session(session);
+      const alreadyReceived = new Map();
+      for (const receipt of previousReceipts) {
+        for (const line of receipt.items) {
+          const id = String(line.productId);
+          alreadyReceived.set(id, (alreadyReceived.get(id) || 0) + Number(line.quantity || 0));
+        }
+      }
+
+      const preparedLines = receivedLines.map(({ productId, quantity }) => {
+        const invoiceEntry = invoiceLines.get(productId);
+        if (!invoiceEntry) {
+          throw new BadRequestError("Received product is not on the linked purchase invoice");
+        }
+        const { line: invoiceLine, index: invoiceLineIndex } = invoiceEntry;
+        const invoicedQty = Number(invoiceLine.quantity || 0);
+        const receivedQty = Math.max(
+          Number(invoiceLine.receivedQuantity || 0),
+          alreadyReceived.get(productId) || 0
+        );
+        const remainingQty = Number((invoicedQty - receivedQty).toFixed(3));
+        if (quantity - remainingQty > 0.0005) {
+          throw new BadRequestError(
+            `Received quantity for '${invoiceLine.name}' exceeds the ${remainingQty} remaining on the invoice`
+          );
+        }
+        const unitCost = Number(invoiceLine.unitCost ?? invoiceLine.purchasePrice ?? invoiceLine.unitPrice ?? 0);
+        return {
+          productId,
+          invoiceLineIndex,
+          quantity,
+          name: invoiceLine.name,
+          unitCost,
+          batchCode: `BATCH-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`,
+        };
+      });
+
+      const receiptId = new mongoose.Types.ObjectId();
+      const receipt = new GoodsReceipt({
+        _id: receiptId,
+        grnNumber: grnNumber || `GRN-${Date.now().toString().slice(-8)}`,
+        purchaseInvoiceId: invoice._id,
+        supplierId: invoice.accountId,
+        items: preparedLines,
+        totalCost: Number(
+          preparedLines
+            .reduce((sum, line) => sum + Number((line.quantity * line.unitCost).toFixed(2)), 0)
+            .toFixed(2)
+        ),
+        date: date ? new Date(date) : new Date(),
+        notes: notes || "",
+        tenantId,
+        operatorId,
+      });
+
+      for (const [receiptLineIndex, line] of preparedLines.entries()) {
+        const item = await Item.findOne({ _id: line.productId, tenantId }).session(session);
+        if (!item) {
+          throw new NotFoundError(`Product not found: ${line.name}`);
+        }
+
+        const previousStock = item.stock;
+        const oldPurchaseCost = Number(item.purchasePrice || 0);
+        const batch = item.addBatch({
+          batchCode: line.batchCode,
+          qty: line.quantity,
+          unitCost: line.unitCost,
+          supplierId: invoice.accountId,
+          purchaseInvoiceId: invoice._id,
+          receivedDate: receipt.date,
+        });
+
+        if (oldPurchaseCost !== line.unitCost) {
+          await ProductPriceAudit.recordAudit(
+            {
+              productId: item._id,
+              productName: item.name,
+              oldPrice: oldPurchaseCost,
+              newPrice: line.unitCost,
+              priceType: "purchasePrice",
+              changeReason: `Goods receipt for invoice ${invoice.invoiceNumber}`,
+              batchCode: batch.batchCode,
+              referenceId: receiptId,
+              referenceType: "GRN",
+              changedBy: operatorId,
+              tenantId,
+            },
+            { session }
+          );
+        }
+
+        await item.save({ session });
+        receipt.items[receiptLineIndex].batchId = batch._id;
+        await StockMovement.recordMovement(
+          {
+            tenantId,
+            productId: item._id,
+            movementType: "Purchase",
+            changeQty: line.quantity,
+            previousStock,
+            newStock: item.stock,
+            unitCost: line.unitCost,
+            unitPrice: item.salePrice,
+            batchId: batch._id,
+            batchCode: batch.batchCode,
+            referenceId: receiptId,
+            referenceType: "GRN",
+            accountId: invoice.accountId,
+            reason: `Goods receipt for purchase invoice ${invoice.invoiceNumber}`,
+            performedBy: operatorId,
+          },
+          { session }
+        );
+        invoice.cartItems[line.invoiceLineIndex].receivedQuantity = Number(
+          (
+            Number(invoice.cartItems[line.invoiceLineIndex].receivedQuantity || 0) +
+            line.quantity
+          ).toFixed(3)
+        );
+      }
+
+      await invoice.save({ session });
+      await receipt.save({ session });
+      return receipt;
     });
   }
 

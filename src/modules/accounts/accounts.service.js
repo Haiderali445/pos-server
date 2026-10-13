@@ -5,6 +5,8 @@ const Bill = require("../../core/models/Bill");
 const { unitOfWork } = require("../../core/database/unitOfWork");
 const { NotFoundError, BadRequestError } = require("../../core/errors/AppError");
 
+const roundMoney = (value) => Number(Number(value || 0).toFixed(2));
+
 class AccountsService {
   async getAccounts({ tenantId = "default-store", accountType = "", search = "" } = {}) {
     const query = { tenantId, isDeleted: { $ne: true } };
@@ -49,9 +51,9 @@ class AccountsService {
       phone: data.phone ? data.phone.trim() : "",
       email: data.email ? data.email.trim().toLowerCase() : "",
       address: data.address ? data.address.trim() : "",
-      currentBalance: Number(data.currentBalance || data.openingBalance || 0),
-      openingBalance: Number(data.openingBalance || 0),
-      creditLimit: Number(data.creditLimit || 0),
+      currentBalance: roundMoney(data.currentBalance || data.openingBalance || 0),
+      openingBalance: roundMoney(data.openingBalance || 0),
+      creditLimit: roundMoney(data.creditLimit || 0),
       tenantId,
       active: true,
     });
@@ -91,8 +93,8 @@ class AccountsService {
     if (!id) {
       throw new BadRequestError("Account ID is required");
     }
-    const payAmount = Number(amount);
-    if (!payAmount || payAmount <= 0) {
+    const payAmount = roundMoney(amount);
+    if (!Number.isFinite(payAmount) || payAmount <= 0) {
       throw new BadRequestError("Valid payment amount greater than zero is required");
     }
 
@@ -102,7 +104,7 @@ class AccountsService {
         throw new NotFoundError("Account not found");
       }
 
-      const previousBalance = Number(account.currentBalance || 0);
+      const previousBalance = roundMoney(account.currentBalance);
 
       // Customer payment reduces receivable; Supplier payment reduces payable
       const updatedAccount = await Account.findOneAndUpdate(
@@ -182,6 +184,84 @@ class AccountsService {
     });
   }
 
+  async recordBalanceAdjustment(
+    id,
+    { amount, reason, direction = "reduce", relatedInvoiceId = null } = {},
+    { tenantId = "default-store", operatorId = "system" } = {}
+  ) {
+    const adjustmentAmount = roundMoney(amount);
+    if (!id) throw new BadRequestError("Account ID is required");
+    if (!Number.isFinite(adjustmentAmount) || adjustmentAmount <= 0) {
+      throw new BadRequestError("Adjustment amount must be greater than zero");
+    }
+    if (!reason || !String(reason).trim()) {
+      throw new BadRequestError("A reason is required for the balance adjustment");
+    }
+    if (!["reduce", "increase"].includes(direction)) {
+      throw new BadRequestError("Adjustment direction must be reduce or increase");
+    }
+
+    return unitOfWork.runInTransaction(async (session) => {
+      const account = await Account.findOne({ _id: id, tenantId }).session(session);
+      if (!account) throw new NotFoundError("Account not found");
+
+      let invoice = null;
+      if (relatedInvoiceId) {
+        invoice = await Bill.findOne({
+          _id: relatedInvoiceId,
+          accountId: account._id,
+          tenantId,
+          invoiceType: { $in: ["Sale", "Purchase"] },
+          status: "completed",
+        }).session(session);
+        if (!invoice) {
+          throw new BadRequestError("The selected invoice does not belong to this account or is not editable");
+        }
+      }
+
+      const balanceChange = direction === "reduce" ? -adjustmentAmount : adjustmentAmount;
+      if (direction === "reduce" && adjustmentAmount - Number(account.currentBalance || 0) > 0.005) {
+        throw new BadRequestError(
+          `Adjustment exceeds the outstanding balance of PKR ${Number(account.currentBalance || 0).toFixed(2)}`
+        );
+      }
+      const updatedAccount = await Account.findOneAndUpdate(
+        { _id: account._id, tenantId },
+        { $inc: { currentBalance: balanceChange } },
+        { new: true, session }
+      );
+
+      const customer = account.accountType === "Customer";
+      const reducesBalance = direction === "reduce";
+      const adjustmentId = new mongoose.Types.ObjectId();
+      const transaction = await AccountTransaction.create(
+        [
+          {
+            _id: adjustmentId,
+            tenantId,
+            accountId: account._id,
+            transactionType: "Adjustment",
+            amount: adjustmentAmount,
+            debit: customer ? (reducesBalance ? 0 : adjustmentAmount) : (reducesBalance ? adjustmentAmount : 0),
+            credit: customer ? (reducesBalance ? adjustmentAmount : 0) : (reducesBalance ? 0 : adjustmentAmount),
+            balanceAfter: updatedAccount.currentBalance,
+            reference_table: "Adjustments",
+            reference_id: adjustmentId,
+            relatedInvoiceId: invoice?._id || null,
+            invoiceNumber: invoice?.invoiceNumber || "",
+            description: reducesBalance ? "Agreed balance reduction" : "Additional balance charge",
+            notes: String(reason).trim(),
+            date: new Date(),
+            operatorId,
+          },
+        ],
+        { session }
+      );
+
+      return { account: updatedAccount, transaction: transaction[0] };
+    });
+  }
+
   /**
    * Fetches account details along with all related Invoices (filtered by account_id)
    * and AccountTransactions to provide a complete, accurate financial audit trail.
@@ -249,6 +329,7 @@ class AccountsService {
 
       return {
         _id: inv._id,
+        billId: inv._id,
         invoiceNumber: inv.invoiceNumber,
         invoiceType: inv.invoiceType,
         date: inv.date || inv.createdAt,
@@ -257,6 +338,7 @@ class AccountsService {
         dueAmount: dueAmt,
         debit,
         credit,
+        balanceChange: Number(((isPayment ? -paidAmt : totalAmt - paidAmt)).toFixed(2)),
         paymentMethod: inv.paymentMethod,
         paymentStatus: inv.paymentStatus,
         cartItems: inv.cartItems,
@@ -272,9 +354,12 @@ class AccountsService {
       const refIdStr = String(tx.reference_id || "");
       const alreadyPresent = unifiedTransactions.some((item) => String(item._id) === refIdStr);
       if (!alreadyPresent) {
+        const balanceChange = isCustomer
+          ? Number(tx.debit || 0) - Number(tx.credit || 0)
+          : Number(tx.credit || 0) - Number(tx.debit || 0);
         unifiedTransactions.push({
           _id: tx._id,
-          invoiceNumber: tx.invoiceNumber || (tx.reference_id ? `REF-${String(tx.reference_id).slice(-6)}` : "TX"),
+          invoiceNumber: tx.invoiceNumber || "",
           invoiceType: tx.transactionType || "Adjustment",
           date: tx.date || tx.createdAt,
           totalAmount: tx.amount,
@@ -282,11 +367,13 @@ class AccountsService {
           dueAmount: 0,
           debit: tx.debit,
           credit: tx.credit,
+          balanceChange,
           paymentMethod: tx.paymentMethod || "manual",
           paymentStatus: "completed",
           notes: tx.description || tx.notes,
           reference_table: tx.reference_table,
           reference_id: tx.reference_id,
+          billId: tx.relatedInvoiceId || (tx.reference_table === "Invoices" ? tx.reference_id : null),
           createdAt: tx.createdAt,
         });
       }

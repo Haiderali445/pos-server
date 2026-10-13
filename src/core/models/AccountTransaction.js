@@ -68,6 +68,12 @@ const accountTransactionSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    relatedInvoiceId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "bills",
+      default: null,
+      index: true,
+    },
     invoiceNumber: {
       type: String,
       trim: true,
